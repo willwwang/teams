@@ -1,0 +1,115 @@
+MODULE "/shares/PXSCosmos14.Prod/PXS.DeleteSignal.PROD/PrivacyAnnotation/PrivacyAnnotation.module";
+USING Privacy;
+
+#DECLARE StartTime DateTime = DateTime.Parse("2023-04-29T00:00:00Z");
+#DECLARE TestEndTime DateTime = DateTime.Parse("2023-05-06T00:00:00Z");
+#DECLARE EndTime DateTime = DateTime.Parse("2024-08-17T00:00:00Z");
+#DECLARE Version string = "06_20_2024";
+
+#DECLARE TenantsFile string = "/local/users/fabiovera/shared/tenant_info/v06142024/unique_tenants_20240612.csv";
+#DECLARE UserListFile string = $"/local/DataScienceProjects/OutcomeMetrics/Copilot/PoC/MetricPublish/UserLists/Version_{@Version}_Users.ss";
+#DECLARE TeamsMeetingViewROW string = "shares/IDEAs.Prod.Data/Publish.Usage.User.Commercial.ActiveUsage.TeamsMeeting/Views/v3/TeamsMeetingDailyUsage.view";
+#DECLARE TeamsMeetingViewEU string = "abfss://shares@ideasneuprodsharetorus.dfs.core.windows.net/Publish.Usage.User.Commercial.ActiveUsage.TeamsMeeting/link/Views/v3/TeamsMeetingDailyUsage.view";
+
+#DECLARE OutputDir string = "local/users/wangwilli/teams";
+#DECLARE RecurringMeetingOutputPath string = @OutputDir + "/recurring_meetings.ss";
+#DECLARE CommonMeetingOutputPath string = @OutputDir + "/common_meetings.ss";
+#DECLARE MeetingGraphOutputPath = @OutputDir + "/meeting_graph.ss";
+
+// Load data
+Tenants = EXTRACT
+        Column0: string, // name
+        Column1: string // id
+    FROM @TenantsFile
+    USING Extractors.Csv(
+        skipFirstNRows: 1
+    );
+
+TenantIds = SELECT
+        Column1 AS TenantId
+    FROM Tenants;
+
+UsersRaw = EXTRACT *
+    FROM @UserListFile
+    USING Extractors.SStream();
+
+Users = SELECT DISTINCT *
+    FROM UsersRaw;
+
+MeetingView = VIEW @TeamsMeetingViewROW
+    PARAMS (
+        StartDate = @StartTime,
+        EndDate = @EndTime
+    );
+
+RecurringMeetings = EXTRACT *
+    FROM @RecurringMeetingOutputPath
+    USING Extractors.SStream();
+
+CommonMeetings = EXTRACT *
+    FROM @CommonMeetingOutputPath
+    USING Extractors.SStream();
+
+
+// Get recurring meetings
+UserMeetings = SELECT DISTINCT
+        MeetingView.MeetingId
+    FROM MeetingView
+    INNER JOIN Users ON MeetingView.UserId == Users.OID
+    WHERE
+        (int)MeetingView.MeetingStartTime.DayOfWeek NOT IN ((int)DayOfWeek.Saturday, (int)DayOfWeek.Sunday);
+
+// Get meeting graph
+TenantMeetingsRaw = SELECT
+        MeetingView.MeetingId,
+        MeetingView.UserId,
+        MeetingView.MeetingStartTime.Date AS date,
+        MeetingView.MeetingStartTime.AddDays(
+            ((int)DayOfWeek.Friday - (int)MeetingView.MeetingStartTime.DayOfWeek + 7) % 7
+        ).Date AS week,
+        SUM((MeetingView.SessionEndTime - MeetingView.SessionStartTime).TotalMinutes) AS session_duration_in_minutes  
+    FROM MeetingView
+    INNER JOIN TenantIds ON MeetingView.OMSTenantId == TenantIds.TenantId
+    WHERE
+        (int)MeetingView.MeetingStartTime.DayOfWeek NOT IN ((int)DayOfWeek.Saturday, (int)DayOfWeek.Sunday)
+    GROUP BY MeetingId, UserId, date, week;
+
+TenantMeetings = SELECT
+        *,
+        COUNT(*) OVER (PARTITION BY MeetingId) AS total_attendees
+    FROM TenantMeetingsRaw;
+
+MeetingGraphRaw = SELECT
+        t1.MeetingId AS origin_meeting,
+        t2.MeetingId AS destination_meeting,
+        t1.total_attendees AS origin_total_attendees,
+        t2.total_attendees AS destination_total_attendees,
+        COUNT(t2.UserId) AS shared_attendees
+    FROM TenantMeetings AS t1
+    INNER JOIN TenantMeetings AS t2 ON t1.UserId == t2.UserId
+    WHERE
+        t1.MeetingId != t2.MeetingId AND
+        t1.date != t2.date AND
+        t1.week <= t2.week.AddDays(14)
+    GROUP BY origin_meeting, destination_meeting, origin_total_attendees, destination_total_attendees;
+
+MeetingGraph = SELECT
+        MeetingGraphRaw.*,
+        CASE
+            WHEN RecurringMeetings.meeting_id != NULL AND CommonMeetings.meeting_id != NULL THEN "both"
+            WHEN RecurringMeetings.meeting_id != NULL THEN "recurring"
+            WHEN CommonMeetings.meeting_id != NULL THEN "common"
+            ELSE "neither"
+        END AS meeting_type
+    FROM MeetingGraphRaw
+    INNER JOIN UserMeetings ON MeetingGraphRaw.origin_meeting == UserMeetings.MeetingId
+    LEFT OUTER JOIN RecurringMeetings ON MeetingGraphRaw.origin_meeting == RecurringMeetings.meeting_id
+    LEFT OUTER JOIN CommonMeetings ON MeetingGraphRaw.origin_meeting == CommonMeetings.meeting_id;
+
+// Output
+OUTPUT MeetingGraph
+TO SSTREAM @MeetingGraphOutputPath
+    HASH CLUSTERED BY origin_meeting, destination_meeting
+    SORTED BY origin_meeting, destination_meeting
+    WITH STREAMEXPIRY "365";
+    

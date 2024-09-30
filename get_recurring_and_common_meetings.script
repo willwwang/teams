@@ -1,0 +1,280 @@
+MODULE "/shares/PXSCosmos14.Prod/PXS.DeleteSignal.PROD/PrivacyAnnotation/PrivacyAnnotation.module";
+USING Privacy;
+
+#DECLARE StartTime DateTime = DateTime.Parse("2023-04-29T00:00:00Z");
+#DECLARE TestEndTime DateTime = DateTime.Parse("2023-05-06T00:00:00Z");
+#DECLARE EndTime DateTime = DateTime.Parse("2024-08-17T00:00:00Z");
+#DECLARE Version string = "06_20_2024";
+
+#DECLARE TenantsFile string = "/local/users/fabiovera/shared/tenant_info/v06142024/unique_tenants_20240612.csv";
+#DECLARE UserListFile string = $"/local/DataScienceProjects/OutcomeMetrics/Copilot/PoC/MetricPublish/UserLists/Version_{@Version}_Users.ss";
+#DECLARE TeamsMeetingViewROW string = "shares/IDEAs.Prod.Data/Publish.Usage.User.Commercial.ActiveUsage.TeamsMeeting/Views/v3/TeamsMeetingDailyUsage.view";
+#DECLARE TeamsMeetingViewEU string = "abfss://shares@ideasneuprodsharetorus.dfs.core.windows.net/Publish.Usage.User.Commercial.ActiveUsage.TeamsMeeting/link/Views/v3/TeamsMeetingDailyUsage.view";
+
+#DECLARE OutputDir string = "local/users/wangwilli/teams";
+#DECLARE AllRecurringMeetingOutputPath string = @OutputDir + "/all_recurring_meetings.ss";
+#DECLARE RecurringMeetingOutputPath string = @OutputDir + "/recurring_meetings.ss";
+#DECLARE CommonMeetingOutputPath string = @OutputDir + "/common_meetings.ss";
+#DECLARE RecurringOutputPath string = @OutputDir + "/recurring_meeting_metrics_by_userweek.ss";
+#DECLARE CommonOutputPath string = @OutputDir + "/common_meeting_metrics_by_userweek.ss";
+#DECLARE RecurringAndCommonOutputPath string = @OutputDir + "/recurring_and_common_meeting_metrics_by_userweek.ss";
+
+
+// Load data
+Tenants = EXTRACT
+        Column0: string, // name
+        Column1: string // id
+    FROM @TenantsFile
+    USING Extractors.Csv(
+        skipFirstNRows: 1
+    );
+
+TenantIds = SELECT
+        Column1 AS TenantId
+    FROM Tenants;
+
+UsersRaw = EXTRACT *
+    FROM @UserListFile
+    USING Extractors.SStream();
+
+Users = SELECT DISTINCT *
+    FROM UsersRaw;
+
+MeetingView = VIEW @TeamsMeetingViewROW
+    PARAMS (
+        StartDate = @StartTime,
+        EndDate = @EndTime
+    );
+
+
+// Get recurring meetings
+
+// Note: this deduplicates meetings with the same ThreadId in the same day:
+// if I meet twice in the same meeting thread in one day, it only counts once.
+// I decided to do that because you're probably just following up on something, rather
+// than meeting about something new. (It's not a recurring follow-up.)
+
+// That's not true for the common and recurring-and-common meetings below, because it's
+// not possible to tell if you're meeting with the same people for the same reason on
+// the same day.
+
+UserMeetingsRaw = SELECT
+        Users.PUID AS puid,
+        MeetingView.MeetingId,
+        MeetingView.ThreadId,
+        MeetingView.MeetingStartTime,
+        MeetingView.FeatureName,
+        MeetingView.SessionStartTime,
+        MeetingView.SessionEndTime
+    FROM MeetingView
+    INNER JOIN Users ON MeetingView.UserId == Users.OID
+    WHERE
+        (int)MeetingView.MeetingStartTime.DayOfWeek NOT IN ((int)DayOfWeek.Saturday, (int)DayOfWeek.Sunday);
+
+AllRecurringMeetings = SELECT DISTINCT
+        MeetingId AS meeting_id
+    FROM UserMeetingsRaw
+    WHERE
+        FeatureName == "RecurringMeeting";
+
+RecurringMeetingsRaw = SELECT
+        ThreadId,
+        MeetingStartTime.Date AS date,
+        FIRST(MeetingId) AS meeting_id
+    FROM UserMeetingsRaw
+    GROUP BY ThreadId, date;
+
+RecurringMeetings = SELECT DISTINCT
+        meeting_id
+    FROM RecurringMeetingsRaw;
+
+UserMeetings = SELECT
+        puid,
+        ThreadId,
+        MeetingStartTime.Date AS date,
+        MeetingStartTime.AddDays(
+            ((int)DayOfWeek.Friday - (int)MeetingStartTime.DayOfWeek + 7) % 7
+        ).Date AS week,
+        FeatureName, // group by to keep
+        SUM((SessionEndTime - SessionStartTime).TotalMinutes) AS session_duration_in_minutes
+    FROM UserMeetingsRaw
+    GROUP BY puid, ThreadId, date, week, FeatureName;
+
+RecurringUserMeetingsByWeekRaw = SELECT
+        puid,
+        week,
+        COUNT(*) AS total_meetings,
+        SUM(session_duration_in_minutes) AS total_meeting_time,
+        SUM(
+            CASE
+                WHEN FeatureName == "RecurringMeeting" THEN 1
+                ELSE 0
+            END
+        ) AS recurring_meetings,
+        SUM(
+            CASE
+                WHEN FeatureName == "RecurringMeeting" THEN session_duration_in_minutes
+                ELSE 0
+            END
+        ) AS recurring_meeting_time
+    FROM UserMeetings
+    GROUP BY puid, week;
+
+RecurringUserMeetingsByWeek = SELECT
+        *,
+        (float)recurring_meetings / total_meetings AS fraction_recurring_meetings,
+        CASE
+            WHEN total_meeting_time != 0 THEN recurring_meeting_time / total_meeting_time
+            ELSE NULL
+        END AS fraction_recurring_meeting_time
+    FROM RecurringUserMeetingsByWeekRaw;
+
+
+// Get common meetings
+TenantMeetingsRaw = SELECT
+        MeetingView.MeetingId,
+        MeetingView.UserId,
+        MeetingView.MeetingStartTime.Date AS date,
+        MeetingView.MeetingStartTime.AddDays(
+            ((int)DayOfWeek.Friday - (int)MeetingView.MeetingStartTime.DayOfWeek + 7) % 7
+        ).Date AS week,
+        SUM((MeetingView.SessionEndTime - MeetingView.SessionStartTime).TotalMinutes) AS session_duration_in_minutes  
+    FROM MeetingView
+    INNER JOIN TenantIds ON MeetingView.OMSTenantId == TenantIds.TenantId
+    WHERE
+        (int)MeetingView.MeetingStartTime.DayOfWeek NOT IN ((int)DayOfWeek.Saturday, (int)DayOfWeek.Sunday)
+    GROUP BY MeetingId, UserId, date, week;
+
+TenantMeetings = SELECT
+        *,
+        COUNT(*) OVER (PARTITION BY MeetingId) AS total_attendees
+    FROM TenantMeetingsRaw;
+
+MeetingGraphRaw = SELECT
+        t1.MeetingId AS origin_meeting,
+        t2.MeetingId AS destination_meeting,
+        t1.total_attendees AS origin_total_attendees,
+        t2.total_attendees AS destination_total_attendees,
+        COUNT(t2.UserId) AS shared_attendees
+    FROM TenantMeetings AS t1
+    INNER JOIN TenantMeetings AS t2 ON t1.UserId == t2.UserId
+    WHERE
+        t1.MeetingId != t2.MeetingId AND
+        t1.date != t2.date AND
+        t1.week <= t2.week.AddDays(14)
+    GROUP BY origin_meeting, destination_meeting, origin_total_attendees, destination_total_attendees;
+
+MeetingGraph = SELECT *
+    FROM MeetingGraphRaw
+    WHERE
+        shared_attendees / origin_total_attendees >= 0.8 AND
+        shared_attendees / destination_total_attendees >= 0.8;
+
+CommonMeetings = SELECT DISTINCT
+        origin_meeting AS meeting_id
+    FROM MeetingGraph;
+
+CommonUserMeetingsByWeekRaw = SELECT
+        Users.PUID AS puid,
+        TenantMeetings.week,
+        COUNT(*) AS total_meetings,
+        SUM(session_duration_in_minutes) AS total_meeting_time,
+        COUNT(CommonMeetings.meeting_id) AS recurring_meetings,
+        SUM(
+            CASE
+                WHEN CommonMeetings.meeting_id != NULL THEN session_duration_in_minutes
+                ELSE 0
+            END
+        ) AS recurring_meeting_time
+    FROM TenantMeetings
+    INNER JOIN Users ON TenantMeetings.UserId == Users.OID
+    LEFT OUTER JOIN CommonMeetings ON TenantMeetings.MeetingId == CommonMeetings.meeting_id
+    GROUP BY puid, week;
+
+CommonUserMeetingsByWeek = SELECT
+        *,
+        (float)recurring_meetings / total_meetings AS fraction_recurring_meetings,
+        CASE
+            WHEN total_meeting_time != 0 THEN recurring_meeting_time / total_meeting_time
+            ELSE NULL
+        END AS fraction_recurring_meeting_time
+    FROM CommonUserMeetingsByWeekRaw;
+
+
+// Get all meetings
+RecurringAndCommonMeetings = SELECT meeting_id FROM RecurringMeetings
+    UNION
+    SELECT meeting_id FROM CommonMeetings;
+
+RecurringAndCommonUserMeetingsByWeekRaw = SELECT
+        Users.PUID AS puid,
+        TenantMeetings.week,
+        COUNT(*) AS total_meetings,
+        SUM(session_duration_in_minutes) AS total_meeting_time,
+        COUNT(RecurringAndCommonMeetings.meeting_id) AS recurring_meetings,
+        SUM(
+            CASE
+                WHEN RecurringAndCommonMeetings.meeting_id != NULL THEN session_duration_in_minutes
+                ELSE 0
+            END
+        ) AS recurring_meeting_time
+    FROM TenantMeetings
+    INNER JOIN Users ON TenantMeetings.UserId == Users.OID
+    LEFT OUTER JOIN RecurringAndCommonMeetings ON TenantMeetings.MeetingId == RecurringAndCommonMeetings.meeting_id
+    GROUP BY puid, week;
+
+RecurringAndCommonUserMeetingsByWeek = SELECT
+        *,
+        (float)recurring_meetings / total_meetings AS fraction_recurring_meetings,
+        CASE
+            WHEN total_meeting_time != 0 THEN recurring_meeting_time / total_meeting_time
+            ELSE NULL
+        END AS fraction_recurring_meeting_time
+    FROM RecurringAndCommonUserMeetingsByWeekRaw;
+
+
+// Output
+OUTPUT AllRecurringMeetings
+TO SSTREAM @AllRecurringMeetingOutputPath
+    HASH CLUSTERED BY meeting_id
+    SORTED BY meeting_id
+    WITH STREAMEXPIRY "365";
+
+OUTPUT RecurringMeetings
+TO SSTREAM @RecurringMeetingOutputPath
+    HASH CLUSTERED BY meeting_id
+    SORTED BY meeting_id
+    WITH STREAMEXPIRY "365";
+
+OUTPUT CommonMeetings
+TO SSTREAM @CommonMeetingOutputPath
+    HASH CLUSTERED BY meeting_id
+    SORTED BY meeting_id
+    WITH STREAMEXPIRY "365";
+
+[Privacy.Asset.IntermediateEngineering]
+[Privacy.DataType.ProductAndServiceUsage]
+[Privacy.Subject.User.ObjectId(Column ="UserId")]
+OUTPUT RecurringUserMeetingsByWeek
+TO SSTREAM @RecurringOutputPath
+    HASH CLUSTERED BY puid, week
+    SORTED BY puid, week
+    WITH STREAMEXPIRY "365";
+
+[Privacy.Asset.IntermediateEngineering]
+[Privacy.DataType.ProductAndServiceUsage]
+[Privacy.Subject.User.ObjectId(Column ="UserId")]
+OUTPUT CommonUserMeetingsByWeek
+TO SSTREAM @CommonOutputPath
+    HASH CLUSTERED BY puid, week
+    SORTED BY puid, week
+    WITH STREAMEXPIRY "365";
+
+[Privacy.Asset.IntermediateEngineering]
+[Privacy.DataType.ProductAndServiceUsage]
+[Privacy.Subject.User.ObjectId(Column ="UserId")]
+OUTPUT RecurringAndCommonUserMeetingsByWeek
+TO SSTREAM @RecurringAndCommonOutputPath
+    HASH CLUSTERED BY puid, week
+    SORTED BY puid, week
+    WITH STREAMEXPIRY "365";
